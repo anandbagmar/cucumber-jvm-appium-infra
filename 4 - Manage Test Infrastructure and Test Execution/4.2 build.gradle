@@ -1,0 +1,605 @@
+import groovy.io.FileType
+import groovy.transform.Synchronized
+import groovyx.gpars.GParsPool
+import io.appium.java_client.service.local.AppiumDriverLocalService
+
+group "viuTest"
+version "1.0-SNAPSHOT"
+
+apply plugin: 'groovy'
+apply plugin: 'java'
+apply plugin: 'idea'
+apply plugin: 'maven'
+apply plugin: 'de.undercouch.download'
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+    maven {
+        url "http://repo.bodar.com"
+    }
+}
+
+buildscript {
+    repositories {
+        maven { url "http://repo.bodar.com" }
+        maven { url 'https://jitpack.io' }
+        mavenCentral()
+        jcenter()
+    }
+    dependencies {
+        classpath "org.codehaus.gpars:gpars:1.2.1",
+                "net.masterthought:cucumber-reporting:3.5.1",
+                "com.github.vidstige:jadb:v1.0.1",
+                "io.appium:java-client:5.0.0-BETA2",
+                "de.undercouch:gradle-download-task:3.1.2"
+    }
+}
+
+ext.cukesVersion = '1.2.5'
+
+project.ext.set("currentDateTime", new Date().format('MM-dd-HH-mm-ss'))
+project.ext.set("log4jProperties", "src/test/resources/log4j2.properties")
+project.ext.set("exitStatus", 0)
+
+configurations {
+    cucumberRuntime {
+        extendsFrom testRuntime
+    }
+}
+
+dependencies {
+    testCompile group: "info.cukes",                    name: "cucumber-core",      version: "$cukesVersion"
+    testCompile group: "info.cukes",                    name: "cucumber-java8",     version: "$cukesVersion"
+    testCompile group: "info.cukes",                    name: "cucumber-junit",     version: "$cukesVersion"
+    testCompile group: "junit",                         name: "junit",              version: "4.12"
+    testCompile group: "org.apache.logging.log4j",      name: "log4j-api",          version: "2.7"
+    testCompile group: "org.apache.logging.log4j",      name: "log4j-core",         version: "2.7"
+    testCompile group: "io.appium",                     name: "java-client",        version: "5.0.0-BETA2"
+    testCompile group: "net.masterthought",             name: "cucumber-reporting", version: "3.5.1"
+    testCompile group: "commons-io",                    name: "commons-io",         version: "2.5"
+    testCompile group: "com.github.vidstige",           name: "jadb",               version: "v1.0.1"
+    testCompile group: "com.googlecode.totallylazy",    name: "totallylazy",        version: "1.85"
+    testCompile group: "org.codehaus.groovy",           name: "groovy-all",         version: "2.4.7"
+    testCompile group: "cglib",                         name: "cglib-nodep",        version: "3.2.4"
+    testCompile files("$buildDir/classes/test")
+}
+
+import io.appium.java_client.service.local.AppiumServiceBuilder
+import io.appium.java_client.service.local.flags.AndroidServerFlag
+import io.appium.java_client.service.local.flags.GeneralServerFlag
+import net.masterthought.cucumber.Configuration
+import net.masterthought.cucumber.ReportBuilder
+import org.apache.commons.io.FilenameUtils
+
+//// tasks - start
+
+task setup(type: Exec) {
+    commandLine 'sh', './brew_gradle.sh'
+    commandLine 'sh', './setup.sh'
+}
+
+task copyRuntimeLibs(type: Copy) {
+    from configurations.testCompile
+    include "*.jar"
+    into "$buildDir/libs"
+}
+
+task wrapper(type: Wrapper) {
+    gradleVersion = project.gradleVersion // version from gradle.properties
+}
+
+task e2eParallel {
+    dependsOn assemble, compileTestJava, copyRuntimeLibs
+    doLast {
+//        printEnvInfo()
+        if (!System.getenv("JAVA_HOME") || !System.getenv("ANDROID_HOME")) {
+            def errorMessage = "***** ERROR - JAVA_HOME / ANDROID_HOME is NOT SET *****"
+            println errorMessage
+            throw new RuntimeException(errorMessage)
+        }
+        if (!System.getenv("CONNECTED_DEVICE_IDS")) {
+            def errorMessage = "***** ERROR - CONNECTED_DEVICE_IDS is NOT SET *****"
+            println errorMessage
+            throw new RuntimeException(errorMessage)
+        }
+
+        def connectedDevicesIDs = System.getenv("CONNECTED_DEVICE_IDS")
+        println "CONNECTED_DEVICE_IDS - $connectedDevicesIDs"
+        def listOfConnectedDevicesIDs = connectedDevicesIDs.split(',')
+
+        def strictMatch = !System.getenv("STRICT_MATCH") ? true : System.getenv("STRICT_MATCH").toBoolean()
+
+        ArrayList<JadbDevice> matchingDevices = getMatchingDevices(listOfConnectedDevicesIDs, strictMatch)
+
+        def devicePool = new DevicePool(matchingDevices)
+        def listOfScenarios = getListOfScenarios()
+        println "listOfScenarios - $listOfScenarios"
+
+        if (listOfScenarios.size() == 0) {
+            println "No Scenarios match execution criteria"
+        } else {
+            def appPath = downloadAppAndUpdatePropertyInConfig()
+
+            GParsPool.withPool(matchingDevices.size()) {
+                listOfScenarios.eachParallel { scenarioName ->
+                    println "\nRunning test for scenario: '$scenarioName'\n"
+
+                    def deviceMap = devicePool.aquire(scenarioName)
+
+                    if (deviceMap._appiumStarted) {
+                        println "[$deviceMap.ID] Appium server already started for this device. Clearing app data"
+                        clearAppDataInDevice(deviceMap.ID)
+                    } else {
+                        deviceMap._appiumPort = (Math.abs(deviceMap.ID.hashCode()) % 4723) + 4723
+                        deviceMap._deviceSpecificAppPath = copyAndUpdateAPKForThisScenario(appPath, (deviceMap._appiumPort).toString())
+                        resetAppInDevice(deviceMap.ID, deviceMap._deviceSpecificAppPath)
+                        deviceMap._appiumServer = startAppiumServer(deviceMap.ID, deviceMap._appiumPort)
+                        deviceMap._appiumStarted = true
+                    }
+
+                    println "[$deviceMap.ID] \tUsing Device: $deviceMap.DEVICE_MAKE with UDID: $deviceMap.ID"
+
+                    runCucumberTest(scenarioName, deviceMap, "PARALLEL")
+                    devicePool.free(deviceMap.ID, scenarioName)
+                    println "\nFinished test for scenario: '$scenarioName'"
+                }
+            }
+        }
+        println "\n\n*********** Final Test exit status - ${project.exitStatus} ***********\n\n"
+        writeDeviceInformationToFile(matchingDevices)
+        stopAllAppiumServers(matchingDevices)
+        createHTMLReport(getReportsDir(), true, isRunningInCI(), getBuildNumber(), matchingDevices, getBuildName())
+        if (project.exitStatus) {
+            def errorMessage =      "\n\n****************************************************************" +
+                    "\n\tError in Test Execution / Report creation" +
+                    "\n\tSee logs for details" +
+                    "\n****************************************************************"
+            println errorMessage
+            throw new GradleException(errorMessage)
+        }
+    }
+}
+
+//// tasks - end
+
+//// test execution - start
+
+def getReportsDir() {
+    def reportsDirectory = isRunningInCI() ? 'testRun/reports' : ('testRun/reports_' + project.currentDateTime)
+    println "Creating directories - $reportsDirectory/logs"
+    File f = new File(reportsDirectory + "/logs");
+    f.mkdirs();
+    return  reportsDirectory
+}
+
+boolean isRunningInCI() {
+    System.getenv("JENKINS_HOME") != null
+}
+
+def getBuildNumber() {
+    (System.getenv("BUILD_ID") != null) ? System.getenv("BUILD_ID") : "1"
+}
+
+def getBuildName() {
+    (System.getenv("JOB_NAME") != null) ? System.getenv("JOB_NAME") : "Viu - e2e"
+}
+
+def updateCukeArgs(scenarioName, outputfileSuffix) {
+    def outputFileNameSuffix = scenarioName.trim().replaceAll("[:. ]","_") + "-" + outputfileSuffix
+    def featuresDir = file("src/test/resources/features")
+
+    def cukeArgs = ["-p", "pretty",
+                    "-p", "junit:${getReportsDir()}/cucumber-junit-report-${outputFileNameSuffix}.xml",
+                    "-p", "json:${getReportsDir()}/cucumber-json-report-${outputFileNameSuffix}.json",
+                    "-n", scenarioName,
+                    "-g", "com.vuclip.viu.stepDefinitions",
+                    "$featuresDir"]
+    return cukeArgs.flatten()
+}
+
+private ArrayList<String> getListOfScenarios() {
+    def stdoutScenarioNames = runShellCommand(getScenarioInformation(), "Get list of applicable scenarios to run", false)
+    def sNames = stdoutScenarioNames.split("\n").findAll { (it.contains('Scenario:') || it.contains('Scenario Outline:' )) && it.contains('.feature:')}.collect{ (it.trim() =~ /Scenario(.?)*: (.*)#.*/)[0][2].trim() }
+    println "Scenario Names - $sNames"
+    sNames
+}
+
+private String getScenarioInformation() {
+    // todo - use getCukeArgs instead of duplicating the command
+    def cmd = "java -cp \"./build/libs/*\" cucumber.api.cli.Main -t ~@pending -t ~@wip -t ~@todo -t ~@manual -g com.vuclip.viu.stepDefinitions src/test/resources/features/ -p pretty -d -m"
+    def envRunTags = System.getenv("run")
+    if (envRunTags != null) {
+        cmd += " -t $envRunTags"
+    }
+    println "Running command - $cmd"
+    cmd
+}
+
+private HashMap<String, String> getOSSpecificPaths(String osName) {
+    println "osName: $osName"
+    HashMap<String, String> osPaths = new HashMap<>();
+    if (osName.contains("mac")) {
+        osPaths.put("nodePath", "/usr/local/bin/node");
+        osPaths.put("appiumPath", "/usr/local/lib/node_modules/appium/build/lib/main.js");
+    } else if (osName.contains("linux")) {
+        osPaths.put("nodePath", "/opt/node/bin/node");
+        osPaths.put("appiumPath", "/opt/node/lib/node_modules/appium/build/lib/main.js");
+    }
+    println osPaths
+    return osPaths;
+}
+
+private def downloadAppAndUpdatePropertyInConfig() {
+    String appType = getAppType()
+    def appUrl = (appType =="app") ? System.getenv("APP_URL") : System.getenv("SDK_URL")
+    println "appUrl - ${appUrl}"
+    def androidAppPath = ""
+    if ((null == appUrl) || (appUrl.isEmpty())) {
+        println "APP_URL not provided for downloading the app. Will check if local file path is provided instead"
+        def appPath = System.getenv("APP_PATH")
+        if ((null == appPath) || (appPath.isEmpty())) {
+            def errorMessage = "***** ERROR - URL to, or path to APK file not provided. APP_PATH not provided for installing the app. Cannot continue with Android tests *****"
+            println errorMessage
+            throw new RuntimeException(errorMessage);
+        } else {
+            println "Using 'ANDROID_APP_PATH=" + appPath + "' - as provided in environment variable - 'APP_PATH'"
+            androidAppPath = appPath
+        }
+    } else {
+        def downloadedFileName = FilenameUtils.getName(new URL(appUrl).getPath())
+        androidAppPath =  "${buildDir.getAbsolutePath()}/" + downloadedFileName
+        println "Download apk from - '${appUrl}' to '${androidAppPath}'"
+        download {
+            src appUrl
+            dest new File(buildDir, downloadedFileName)
+            quiet false
+            overwrite false
+        }
+
+        runShellCommand("ls -larth ${buildDir.getAbsolutePath()}", "See downloaded apk file here - ")
+
+        File f = new File(androidAppPath);
+        println "Does downloaded apk exist? - " - f.exists()
+        if (!f.exists()) {
+            throw  new RuntimeException("APK could not be downloaded")
+        }
+        println "Using 'ANDROID_APP_PATH=" + androidAppPath + "' - as provided by environment variable - 'APP_URL'"
+    }
+    androidAppPath
+}
+
+private String getAppType() {
+    def appType = !System.getenv("APP_TYPE") ? "app" : System.getenv("APP_TYPE")
+    println "APP_TYPE - ${appType}"
+    appType
+}
+
+private String copyAndUpdateAPKForThisScenario(String orgAPKPath, String prefix) {
+    File orgFile = new File(orgAPKPath)
+    def destFile = new File(orgFile.getParent() + "/" + prefix + "_" + orgFile.getName())
+    if (destFile.exists()) {
+        println "${destFile.getName()} exists? - ${destFile.exists()}"
+        println "${destFile.getName()} already exists. Delete it first"
+        destFile.delete()
+        println "${destFile.getName()} exists? - ${destFile.exists()}"
+    } else {
+        println "${destFile.getName()} does NOT exists"
+    }
+    destFile << orgFile.bytes
+}
+
+private void runCucumberTest(scenarioName, deviceMap, message) {
+    def cukeArgs = updateCukeArgs(scenarioName, deviceMap.DEVICE_MAKE + "_" + deviceMap.ID)
+    def reportsDir = getReportsDir()
+    def outputMessage =
+            "\n\t** APP_TYPE            : ${getAppType()}" +
+                    "\n\t** scenarioName        : $scenarioName" +
+                    "\n\t** Appium port         : $deviceMap._appiumPort" +
+                    "\n\t** Device make         : $deviceMap.DEVICE_MAKE" +
+                    "\n\t** Device id           : $deviceMap.ID" +
+                    "\n\t** Platform Version    : $deviceMap.PLATFORM_VERSION" +
+                    "\n\t** API_LEVEL           : $deviceMap.API_LEVEL" +
+                    "\n\t** FULL_RESET          : $deviceMap._fullReset" +
+                    "\n\t** NO_RESET            : $deviceMap._noReset" +
+                    "\n\t** ANDROID_APP_PATH    : $deviceMap._deviceSpecificAppPath" +
+                    "\n\t** Cucumber args       : $cukeArgs"
+    println "[$deviceMap.ID] Start executing test - $message - $outputMessage"
+    def result = javaexec {
+        ignoreExitValue = true
+        environment "reportsDir", reportsDir
+        jvmArgs =   ["-Dlog4j.configurationFile=$project.log4jProperties",
+                     "-DreportsDir=$reportsDir",
+                     "-DAPP_TYPE=${getAppType()}",
+                     "-DAPI_LEVEL=$deviceMap.API_LEVEL",
+                     "-DDEVICE_MAKE=$deviceMap.DEVICE_MAKE",
+                     "-DID=$deviceMap.ID",
+                     "-DPLATFORM_VERSION=$deviceMap.PLATFORM_VERSION",
+                     "-DAPPIUM_PORT=$deviceMap._appiumPort",
+                     "-DANDROID_APP_PATH=$deviceMap._deviceSpecificAppPath",
+                     "-DNO_RESET=$deviceMap._noReset",
+                     "-DFULL_RESET=$deviceMap._fullReset"]
+        args cukeArgs
+        classpath = sourceSets.test.output + configurations.cucumberRuntime
+        main = "cucumber.api.cli.Main"
+    }
+    println "[$deviceMap.ID] Finished executing Test (exit status: ${result.getExitValue()}) - $outputMessage"
+    if (result.getExitValue() != 0) {
+        println "\n\t\t*********** [$deviceMap.ID] Setting exitStatus to fail ***********\n"
+        project.ext.set("exitStatus", result.getExitValue())
+    }
+    println("[$deviceMap.ID] - '${scenarioName}': Scenario output: $reportsDir/cucumber/${scenarioName}.log ")
+}
+
+//// test execution - end
+
+//// device management - start
+
+def startADB() {
+    def startAdbCommand = "$System.env.ANDROID_HOME/platform-tools/adb devices -l"
+    def message = "Show list of connected devices - $startAdbCommand"
+    runShellCommand(startAdbCommand, message)
+}
+
+private void resetAppInDevice(String deviceID, String deviceSpecificAppPath) {
+    uninstallAppFromDevice(deviceID)
+    installAppInDevice(deviceSpecificAppPath, deviceID)
+    clearAppDataInDevice(deviceID)
+}
+
+private void clearAppDataInDevice(String deviceID) {
+    def clearDataCommand = "$System.env.ANDROID_HOME/platform-tools/adb -s ${deviceID} shell pm clear com.vuclip.viu"
+    def clearDataMessage = "[$deviceID] CLEARING App data in device using command - '$clearDataCommand'"
+    runShellCommand(clearDataCommand, clearDataMessage)
+}
+
+private void installAppInDevice(String deviceSpecificAppPath, String deviceID) {
+    def installAppCommand = "$System.env.ANDROID_HOME/platform-tools/adb -s ${deviceID} install -r ${deviceSpecificAppPath}"
+    def installMessage = "[$deviceID] INSTALLING App in device using command - '$installAppCommand'"
+    runShellCommand(installAppCommand, installMessage, false)
+}
+
+private void uninstallAppFromDevice(deviceID) {
+    def appNames = ["com.vuclip.viu", "io.appium.uiautomator2.server", "io.appium.uiautomator2.server.test"]
+
+    appNames.each { appPackage ->
+        def uninstallAppCommand = "$System.env.ANDROID_HOME/platform-tools/adb -s ${deviceID} uninstall $appPackage"
+        def uninstallMessage = "[$deviceID] UNINSTALLING App - $appPackage from device using command - '$uninstallAppCommand'"
+        runShellCommand(uninstallAppCommand, uninstallMessage)
+    }
+}
+
+import se.vidstige.jadb.JadbConnection
+import se.vidstige.jadb.JadbDevice
+
+class DevicePool {
+    List<Map> devices
+    DevicePool(List<Map> devices) {
+        this.devices = devices
+    }
+
+    @Synchronized
+    Map aquire(scenarioName) {
+        def deviceMap = devices.find { !it._occupied }
+        println "\t[$deviceMap.ID] Acquiring device - $deviceMap \n\t\tfor scenario: '$scenarioName'"
+        deviceMap._occupied = true
+        println "\t[$deviceMap.ID] Acquired  device - $deviceMap \n\t\tfor scenario: '$scenarioName'"
+        deviceMap
+    }
+
+    @Synchronized
+    void free(id, scenarioName) {
+        def deviceMap = devices.find { it.ID == id }
+        println "\t[$deviceMap.ID] Free device - $deviceMap \n\t\tfor scenario: $scenarioName"
+        deviceMap._occupied = false
+        println "\t[$deviceMap.ID] Released device - $deviceMap \n\t\tfor scenario: $scenarioName"
+    }
+}
+
+import java.util.concurrent.TimeUnit
+
+def getDevices() {
+    new JadbConnection().devices.collect { device ->
+        [
+                ID                  : device.executeShell("getprop", "ro.serialno").text.trim(),
+                API_LEVEL           : device.executeShell("getprop", "ro.build.version.sdk").text.trim(),
+                DEVICE_MAKE         : device.executeShell("getprop", "ro.product.brand").text.trim(),
+                PLATFORM_VERSION    : device.executeShell("getprop", "ro.build.version.release").text.trim(),
+                device              : device,
+                _occupied           : false,
+                _appiumStarted      : false,
+                _appiumServer       : null,
+                _appiumPort         : 0,
+                _noReset            : false,
+                _fullReset          : false
+        ]
+    }
+}
+
+private ArrayList<JadbDevice> getMatchingDevices(listOfConnectedDevicesIDs, strictMatch) {
+    println "** Get Matching Devices for - "
+    println "\t\tList Of Connected Devices IDs  - $listOfConnectedDevicesIDs"
+    println "\t\tStrict Match                   - $strictMatch"
+    startADB()
+    ArrayList<JadbDevice> matchingDevices = getDevices().findAll { deviceProps ->
+        println "Checking deviceProps.ID - $deviceProps.ID"
+        listOfConnectedDevicesIDs.contains(deviceProps.ID)
+    }
+    println "** Number of matching devices found - $matchingDevices.size \n $matchingDevices"
+
+    if (!matchingDevices.size()) {
+        def errorMessage = "***** ERROR - No matching devices found for provided list of connected devices - $listOfConnectedDevicesIDs *****"
+        println errorMessage
+        throw new RuntimeException(errorMessage)
+    }
+
+    println "Strict Device Matching - $strictMatch"
+    if (strictMatch == true) {
+        if (matchingDevices.size() == listOfConnectedDevicesIDs.size()) {
+            println "Found exact number of devices specified for Test Execution Agent on Machine. Test Execution will now proceed"
+        } else {
+            def errorMessage = "***** ERROR - Did NOT find exact number of devices specified for Test Execution Agent on Machine. Test Execution WILL NOT proceed *****"
+            println errorMessage
+            throw new RuntimeException(errorMessage)
+        }
+    } else {
+        println "Run test with whichever device(s) are available from the provided list - $listOfConnectedDevicesIDs"
+    }
+    matchingDevices
+}
+
+//// device management - end
+
+//// utilities - start
+
+private void printEnvInfo() {
+    runShellCommand("node -v", "node version")
+    runShellCommand("npm -v", "npm version")
+    runShellCommand("appium -v", "appium version")
+    runShellCommand("appium-doctor", "appium-doctor status")
+}
+
+private String runShellCommand(String command, String message, Boolean printOutput = true) {
+    println "[SHELL COMMAND] $message"
+    def stdoutFromCommand = new ByteArrayOutputStream()
+    exec {
+        commandLine 'sh', "-c", command
+        standardOutput = stdoutFromCommand;
+    }
+    def commandOutput = stdoutFromCommand.toString()
+    if (printOutput) {
+        println commandOutput
+    }
+    commandOutput
+}
+
+//// utilities - end
+
+//// appium - start
+
+private AppiumDriverLocalService startAppiumServer(id, appiumPort) {
+    AppiumDriverLocalService service = null;
+    killExistingAppiumServerOnThisPortIfExisting(appiumPort);
+
+    println "[$id] Starting Appium on port - $appiumPort"
+
+    HashMap<String, String> osPaths = getOSSpecificPaths(System.getProperty("os.name").toLowerCase());
+    if (osPaths.get("appiumPath") != null) {
+        println "[$id] Starting Appium from - " + osPaths.toString()
+        service = AppiumDriverLocalService.buildService(new AppiumServiceBuilder()
+                .usingDriverExecutable(new File(osPaths.get("nodePath")))
+                .withIPAddress("0.0.0.0")
+                .usingPort(appiumPort)
+                .withArgument(GeneralServerFlag.LOG_LEVEL,"error")
+                .withAppiumJS(new File(osPaths.get("appiumPath")))
+                .withLogFile(new File(getReportsDir() + "/logs/appiumLogs-" + id + ".txt"))
+                .withStartUpTimeOut(1, TimeUnit.MINUTES));
+    } else {
+        println "[$id] ERROR - Appium path not provided"
+    }
+    service.start();
+    service
+}
+
+def killExistingAppiumServerOnThisPortIfExisting(portNumber) {
+    println "\nKill existing Appium Server on port - $portNumber, if already running"
+    def killCommand = 'ps aux | grep -p "[n]ode.*appium.*' + portNumber + '" | awk \'{print $2}\' | xargs kill'
+    def killMessage = "\tkillCommand - $killCommand"
+    runShellCommand(killCommand, killMessage)
+}
+
+def stopAllAppiumServers(ArrayList<JadbDevice> jadbDevices) {
+    println "\n** Stopping all Appium Servers AND uninstall APP from all Matching Devices **"
+    jadbDevices.each {device ->
+        println "Stopping Appium Server for device - $device.ID"
+        if(device._appiumStarted) {
+            if (device._appiumServer == null) {
+                println "Appium Server is already null"
+            } else {
+                println "Stopping Appium Server"
+                device._appiumServer.stop()
+            }
+            device._appiumStarted = false
+        } else {
+            println "Appium Server was not running. Nothing to stop for this device - $device.ID"
+        }
+        uninstallAppFromDevice(device.ID)
+    }
+}
+
+//// appium - end
+
+//// reports - start
+
+private void createHTMLReport(String reportsDir, boolean isRunningInParallel, boolean isRunningWithJenkins, String buildNumber, ArrayList<JadbDevice> matchingDevices, String buildProjectName) {
+    String message = "Creating Custom HTML Reports here - " + reportsDir
+    message += "\n\tAPP_TYPE              - " + getAppType()
+    message += "\n\tisRunningInParallel   - " + isRunningInParallel
+    message += "\n\tisRunningWithJenkins  - " + isRunningWithJenkins
+    message += "\n\tbuildNumber           - " + buildNumber
+    message += "\n\tbuildProjectName      - " + buildProjectName
+    message += "\n\tmatching Devices      - " + matchingDevices
+    println message
+
+    File reportOutputDirectory = new File(reportsDir)
+    List<String> jsonReportFiles = getListOfJsonReports(reportOutputDirectory)
+
+    ReportBuilder reportBuilder = null
+
+    Configuration configuration = createReportBuilderConfiguration(reportOutputDirectory, buildProjectName, isRunningInParallel, isRunningWithJenkins, buildNumber, matchingDevices)
+
+    try {
+        reportBuilder = new ReportBuilder(jsonReportFiles, configuration);
+        reportBuilder.generateReports();
+        println "\n\tHTML Reports are available here - $reportsDir"
+    } catch (Exception e) {
+        println "ERROR in creating consolidated reports", e
+    }
+}
+
+private Configuration createReportBuilderConfiguration(File reportOutputDirectory, String buildProjectName, boolean isRunningInParallel, boolean isRunningWithJenkins, String buildNumber, ArrayList<JadbDevice> matchingDevices) {
+    Configuration configuration = new Configuration(reportOutputDirectory, buildProjectName)
+    configuration.setParallelTesting(isRunningInParallel)
+    configuration.setRunWithJenkins(isRunningWithJenkins)
+    configuration.setBuildNumber(buildNumber)
+    matchingDevices.each { device ->
+        configuration.addClassifications(device.DEVICE_MAKE, "ID: " + device.ID + ", API: " + device.API_LEVEL + ", APPIUM PORT: " + device._appiumPort);
+    }
+    configuration
+}
+
+private List<String> getListOfJsonReports(File reportOutputDirectory) {
+    List<String> jsonReportFiles = new ArrayList()
+
+    reportOutputDirectory.eachFileRecurse(FileType.FILES) { file ->
+        if (file.name.endsWith(".json")) {
+            jsonReportFiles.add(file.getAbsolutePath())
+        }
+    }
+    println ("Using these files to generate consolidated report - $jsonReportFiles")
+    jsonReportFiles
+}
+
+def writeDeviceInformationToFile(ArrayList<JadbDevice> matchingDevices) {
+    def myDevicesFileName = getReportsDir() + "/myDevices.txt"
+    println "Creating file - $myDevicesFileName with Matching Device information"
+    ArrayList<HashMap> deviceClassification = new ArrayList<>()
+    matchingDevices.each { device ->
+        HashMap<String,String> devicesToJson = new HashMap<>()
+        devicesToJson.put("key", device.DEVICE_MAKE)
+        devicesToJson.put("value", "ID: " + device.ID + ", API: " + device.API_LEVEL + ", APPIUM PORT: " + device._appiumPort)
+        deviceClassification.add(devicesToJson)
+    }
+    def json = new groovy.json.JsonBuilder()
+    json {
+        classifications deviceClassification
+    }
+    File file = new File(myDevicesFileName)
+    file.write json.toPrettyString()
+    println file.text
+}
+
+//// reports - end

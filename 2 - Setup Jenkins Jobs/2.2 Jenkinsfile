@@ -1,0 +1,82 @@
+echo "** Run job - ${JOB_NAME} **"
+def inferredNodeName = "${JOB_NAME}".replace("-sdk","").replace("-app","")
+echo "** Inferred Node Name - ${inferredNodeName} **"
+node("${inferredNodeName}") {
+    echo "** Started job execution on agent - ${inferredNodeName} **"
+    echo "***** Node name - $env.NODE_NAME with labels - '$env.NODE_LABELS' *****"
+    wrap([$class: 'AnsiColorBuildWrapper']) {
+        def buildResult=''
+        notifyBuild('STARTED')
+        
+        stage('Git Checkout') {
+            checkout([$class: 'GitSCM', branches: [[name: '*/master']],
+            doGenerateSubmoduleConfigurations: false,
+            extensions:     [[$class: 'CheckoutOption'],
+                             [$class: 'PruneStaleBranch'],
+                             [$class: 'CloneOption', noTags: false, reference: '', shallow: true],
+                             [$class: 'CleanCheckout']],
+            submoduleCfg: [],
+        }
+        try {
+            stage('Build and Test') {
+                echo "***** Start test execution *****"
+                sh './gradlew e2eParallel'
+                echo "***** Completed test execution *****"
+            }
+        } catch(Exception e) {
+            echo "Failure in Build and test"
+            echo "Continuing to Archive Artifacts stage"
+            buildResult = "FAILED"
+        }
+
+        stage("Archive Artifacts") {
+            echo "***** Archive Artifacts and Test Results *****"
+            archiveArtifacts artifacts:'testRun/reports/**/*.*',
+                             fingerprint:true
+        }
+
+        stage("Publish Reports") {
+            echo "***** Publish Reports *****"
+            step([
+                $class: 'CucumberReportPublisher',
+                failedFeaturesNumber: 0,
+                failedScenariosNumber: 0,
+                failedStepsNumber: 0,
+                fileExcludePattern: '',
+                fileIncludePattern: '**/*.json',
+                jsonReportDirectory: 'testrun/reports',
+                parallelTesting: true,
+                pendingStepsNumber: 0,
+                skippedStepsNumber: 0,
+                trendsLimit: 0,
+                undefinedStepsNumber: 0
+            ])
+        }
+
+        notifyBuild(buildResult)
+    }
+}
+
+def notifyBuild(String buildStatus = 'STARTED') {
+    // build status of null means successful
+    buildStatus = buildStatus ? buildStatus : 'SUCCESSFUL'
+    def jobName = env.JOB_NAME
+    def pipelineName = jobName.replaceFirst('/.+', '')
+    def URL = <URL_OF_SPECIFIC_BUILD_NUMBER_THAT_TRIGGERED_THIS_JOB>
+
+    def subject = "${buildStatus}: <$URL | '${env.JOB_NAME} [${env.BUILD_NUMBER}]'>"
+
+    // Override default values based on build status
+    def colorCode = '#FF0000'
+    if (buildStatus == 'STARTED') {
+        colorCode = '#FFFF00'
+    }
+    else if (buildStatus == 'SUCCESSFUL') {
+        colorCode = '#00FF00'
+    }
+    else {
+        manager.buildFailure()
+    }
+
+    slackSend channel: '#ci', color: colorCode, message:subject, teamDomain: '<SLACK_TEAM_DOMAIN>', tokenCredentialId: '<TOKEN_CREDENTIAL_ID>'
+}
