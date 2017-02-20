@@ -8,7 +8,7 @@ echo "********************************************"
 echo Starting Jenkins Slave
 echo User=$USER
 echo Node name=$NODE_NAME
-ecoh Machine=$HOSTNAME
+echo Machine=$HOSTNAME
 echo JAVA_HOME=$JAVA_HOME
 echo ANDROID_HOME=$ANDROID_HOME
 echo "********************************************"
